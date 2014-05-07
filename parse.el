@@ -20,6 +20,7 @@
 ;;; operands (E): no side effects, just values; all use arithmetic modulo 2^16
 ;;;
 ;;;   (+ E1 E2)                addition
+;;;   (- E)                    negation
 ;;;   (& E1 E2)                logical and
 ;;;   (| E1 E2)                logical or
 ;;;   (fetch Z E)              memory fetch
@@ -65,11 +66,14 @@ nil and leave point unmoved."
       (error "bad constant"))
     (* (string-to-number (match-string 3 c) 16)
        (if (match-string 2 c) -1 1))))
-;; (parse-const "")
-;; (parse-const "0x1") 1
-;; (parse-const "0xfff") 4095
-;; (parse-const "-0x5") -5
-;; (parse-const "-0x1") -1
+
+(unit-tests
+  (test-equal (parse-const "0x0") 0)
+  (test-equal (parse-const "0x1") 1)
+  (test-equal (parse-const "0xfff") 4095)
+  (test-equal (parse-const "-0x5") -5)
+  (test-equal (parse-const "-0x1") -1)
+  )
 
 (defconst register-regexp "\\(r1[0-5]\\|r[0-9]\\|sp\\|pc\\|sr\\)")
 (defun parse-register (r)
@@ -91,21 +95,22 @@ nil and leave point unmoved."
             ((looking-at (concat "&" const-regexp))
              `(fetch ,parse-size ,(parse-const (match-string 1))))
             ((looking-at (concat const-regexp "(" register-regexp ")"))
-             `(fetch ,parse-size (+ ,(parse-const (match-string 1))
-                                    ,(parse-register (match-string 4)))))
+             `(fetch ,parse-size ,(expr-+ (parse-const (match-string 1))
+                                          (parse-register (match-string 4)))))
             (t nil))))
     (when v (goto-char (match-end 0)))
     v))
-
-(defconst opcode-table
-  '((mov move (source dest))
-    (ret return ())))
 
 (defun parse ()
   "Parse Microcorruption-style MSP430 disassembly at point.
 Return a form (MARKER ADDR (S ...))."
   (let ((m (point-marker)))
     (cond
+     ((looking-at "\\([0-9a-f]+\\):  \\(?:[0-9a-f]+ \\)+ *\\([a-z.]+\\)+")
+      (let ((addr (string-to-number (match-string 1) 16)))
+        (goto-char (match-beginning 2))
+        (let ((stmts (parse-insn)))
+          (list m addr stmts))))
      ((looking-at "\\([0-9a-f]+\\) <\\(.*\\)>")
       (prog1 (list m (match-string-no-properties 1) 'other 'label (match-string-no-properties 2))
         (forward-line 1)))
@@ -115,44 +120,194 @@ Return a form (MARKER ADDR (S ...))."
      ((looking-at "\\([0-9a-f]+\\): \"\\([^:]*\\)\"")
       (prog1 (list m (match-string-no-properties 1) 'other 'string (match-string-no-properties 2))
         (forward-line 1)))
-
-     ;; Real instructions.
-     ((looking-at "\\([0-9a-f]+\\):  \\(?:[0-9a-f]+ \\)+ *\\([a-z]+\\(\\.b\\)?\\)[ \t]*")
-      (let ((addr (string-to-number (match-string 1) 16))
-            (opcode (intern (match-string-no-properties 2)))
-            (byte-suffix (match-end 3)))
-        (goto-char (match-end 0))
-        (let* ((parse-size (if byte-suffix 'byte 'word))
-               (opns (comma-list 'parse-operand)))
-          (unless (eolp) (error "junk at end of line"))
-          (forward-line 1)
-          (let ((def (assq opcode opcode-table)))
-            (unless def (error "unrecognized opcode"))
-            (unless (= (length opns) (length (caddr def))) (error "wrong number of operands"))
-            (cl-mapc (lambda (opnt opn)
-                       (case opnt
-                         ((dest)
-                          (unless (and (consp opn) (memq (car opn) '(reg fetch)))
-                            (error "destination operations must be 'reg' or 'fetch'")))
-                         ((const)
-                          (unless (numberp opn)
-                            (error "operand must be a constant")))
-                         ((reg)
-                          (unless (and (consp opn) (eq (car opn) 'reg))
-                            (error "operand must be a register")))))
-                     (caddr def) opns)
-            (let ((stmts
-                   (case (cadr def)
-                     ((move)
-                      (pcase opns
-                        (`(,src (reg ,r)) `((set nil ,r ,src)))
-                        (`(,src (fetch ,z ,e)) `((store ,z ,e ,src)))
-                        (_ (error "bad move opnd check"))))
-                     ((return)
-                      '((set nil 0 (fetch word (reg 1)))
-                        (set nil 1 (+ 2 (reg 1)))))
-                     (otherwise (error "bogus instruction type in opcode-table")))))
-              (list m addr stmts))))))
-
      (t nil))))
 
+(defconst opcode-table
+  '((and (source dest) arithmetic & +)
+    (bis (source dest) arithmetic | nil)
+    (sub (source dest) arithmetic - -)
+    (mov (source dest) move)
+    (ret () misc)))
+
+(defun parse-insn ()
+  "Parse the MSP430 instruction at point.
+Return a list of statements that have the same effect as the instruction."
+  (unless (looking-at "\\([a-z]+\\)\\(\\.b\\)?[ \t]*")
+    (error "malformed opcode"))
+  (let ((opcode (intern (match-string-no-properties 1)))
+        (byte-suffix (match-end 2)))
+    (goto-char (match-end 0))
+    (let* ((parse-size (if byte-suffix 'byte 'word))
+           (opns (comma-list 'parse-operand)))
+      (unless (eolp) (error "junk at end of line"))
+      (forward-line 1)
+      (let ((def (assq opcode opcode-table)))
+        (unless def (error "unrecognized opcode"))
+        (unless (= (length opns) (length (cadr def))) (error "wrong number of operands"))
+        (cl-mapc (lambda (opnt opn)
+                   (case opnt
+                     ((dest)
+                      (unless (and (consp opn) (memq (car opn) '(reg fetch)))
+                        (error "destination operations must be 'reg' or 'fetch'")))
+                     ((const)
+                      (unless (numberp opn)
+                        (error "operand must be a constant")))
+                     ((reg)
+                      (unless (and (consp opn) (eq (car opn) 'reg))
+                        (error "operand must be a register")))))
+                 (cadr def) opns)
+        (case (caddr def)
+          ((arithmetic)
+           (let ((src (if byte-suffix (expr-force-byte (car opns)) (car opns)))
+                 (dst (cadr opns))
+                 (cc  (nth 4 def)))
+             (stmt-write cc dst (expr-any (cadddr def) dst src))))
+          ((move)
+           (let ((src (if byte-suffix (expr-force-byte (car opns)) (car opns)))
+                 (dst (cadr opns)))
+             (stmt-write nil dst src)))
+          ((misc)
+           (case opcode
+             ((return)
+              '((set nil 0 (fetch word (reg 1)))
+                (set nil 1 (+ 2 (reg 1)))))))
+          (otherwise (error "bogus instruction type in opcode-table")))))))
+
+;; (parse-insn) mov.b	#0x0, 0x2400(r15)
+;; ((store byte (+ 9216 (reg 15)) 0))
+;;
+;; (parse-insn) mov.b   r10, 0x24(r11)
+;; ((store byte (+ 36 (reg 11)) (& 255 (reg 10))))
+;;
+;; (parse-insn) mov.b   0x0(r10), 0x0(r11)
+;; ((store byte (reg 11) (fetch byte (reg 10))))
+;;
+;; (parse-insn) mov   0x0(r10), 0x0(r11)
+;; ((store word (reg 11)  (fetch word (reg 10))))
+;;
+;; (parse-insn) mov	#0x4400, sp
+;; ((set nil 1 17408))
+;;
+;; (parse-insn) mov.b	#-0x1, r5
+;; ((set nil 5 255))
+;;
+;; (parse-insn) and.b	#-0x1, r5
+;; ((set + 5 (& 255 (reg 5))))
+;;
+;; (parse-insn) and.b   #0xff, r5
+;; ((set + 5 (& 255 (reg 5))))
+
+(defun bytep (n)
+  (and (numberp n) (<= 0 n) (<= n 255)))
+
+(defun expr-bytep (e)
+  (pcase e
+    ((pred bytep) t)
+    (`(fetch byte ,_) t)
+    (`(& ,a ,b) (or (expr-bytep a) (expr-bytep b)))
+    (_ nil)))
+
+(defun expr-& (a b)
+  (cond
+   ((and (numberp a) (numberp b))
+    (logand a b))
+   ((numberp b)
+    (expr-& b a))
+   ((and (numberp a) (zerop a)) 0)
+   ((and (numberp a) (= (logand a #xffff) #xffff))
+    b)
+   ((and (numberp a) (= (logand a #xff) #xff) (expr-bytep b))
+    b)
+   (t (pcase `(& ,a ,b)
+        ((and `(& ,x (& ,y ,z))
+              (guard (and (numberp x) (numberp y))))
+         (expr-& (logand x y) z))
+        (e e)))))
+
+(unit-tests
+  (test-equal (expr-& 4 5) 4)
+  (test-equal (expr-& 'x 5) '(& 5 x))
+  (test-equal (expr-& 'x 0) 0)
+  (test-equal (expr-& 'x -1) 'x)
+  (test-equal (expr-& '(fetch byte 0) 255) '(fetch byte 0))
+  (test-equal (expr-& 7 '(& 3 x)) '(& 3 x))
+  (test-equal (expr-& '(& 3 x) 7) '(& 3 x))
+  (test-equal (expr-& 'x 'y) '(& x y))
+  )
+
+(defun expr-force-byte (e)
+  (expr-& #xff e))
+
+(unit-tests
+  (test-equal (expr-force-byte 0) 0)
+  (test-equal (expr-force-byte 255) 255)
+  (test-equal (expr-force-byte 256) 0)
+  (test-equal (expr-force-byte '(reg 4)) '(& 255 (reg 4)))
+  (test-equal (expr-force-byte '(fetch word 42)) '(& 255 (fetch word 42)))
+  (test-equal (expr-force-byte '(fetch byte 42)) '(fetch byte 42))
+  (test-equal (expr-force-byte '(& (fetch byte 42) 1023)) '(& (fetch byte 42) 1023))
+  (test-equal (expr-force-byte '(& (fetch word 42) 15)) '(& (fetch word 42) 15))
+  )
+
+(defun expr-+ (a b)
+  (cond
+   ((and (numberp a) (numberp b))
+    (logand #xffff (+ a b)))
+   ((numberp b)
+    (expr-+ b a))
+   ((and (numberp a) (zerop a)) b)
+   (t (pcase `(+ ,a ,b)
+        ((and `(+ ,x (+ ,y ,z))
+              (guard (and (numberp x) (numberp y))))
+         (expr-+ (logand #xffff (+ x y)) z))
+        (`(+ (- ,x) (- ,y)) (expr-neg (expr-+ x y)))
+        (e e)))))
+
+(unit-tests
+  (test-equal (expr-+ 10 20) 30)
+  (test-equal (expr-+ 'x 20) '(+ 20 x))
+  (test-equal (expr-+ 'x 0) 'x)
+  (test-equal (expr-+ '(+ 20 x) 10) '(+ 30 x))
+  (test-equal (expr-+ 'x 'y) '(+ x y))
+  (test-equal (expr-+ '(- x) '(- y)) '(- (+ x y)))
+  )
+
+(defun expr-neg (a)
+  (cond
+   ((numberp a)
+    (logand #xffff (- a)))
+   (t (pcase `(- ,a)
+        (`(- (- ,e)) e)
+        (`(- (+ ,x (- ,y))) (expr-+ y (expr-neg x)))
+        (e e)))))
+
+(unit-tests
+  (test-equal (expr-neg 1) 65535)
+  (test-equal (expr-neg '(- x)) 'x)
+  (test-equal (expr-neg 'x) '(- x))
+  )
+
+(defun expr-- (a b) (expr-+ a (expr-neg b)))
+
+(unit-tests
+  (test-equal (expr-- 10 20)  65526)
+  (test-equal (expr-- 'x 20) '(+ 65516 x))
+  (test-equal (expr-- 'x 0) 'x)
+  (test-equal (expr-- 0 'x) '(- x))
+  (test-equal (expr-- 10 'x) '(+ 10 (- x)))
+  (test-equal (expr-- 10 (expr-- 10 'x)) 'x)
+  (test-equal (expr-- 12 (expr-- 10 'x)) '(+ 2 x))
+  )
+
+(defun expr-any (op a b)
+  (case op
+    ((+) (expr-+ a b))
+    ((-) (expr-- a b))
+    ((&) (expr-& a b))
+    (otherwise (list op a b))))
+
+(defun stmt-write (cc dst src)
+  (pcase dst
+    (`(reg ,r) `((set ,cc ,r ,src)))
+    (`(fetch ,z ,e) `((store ,z ,e ,src)))
+    (_ (error "bad dst"))))
