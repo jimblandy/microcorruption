@@ -65,7 +65,7 @@ test."
      (condition-case desc
          (progn
            (progn ,@body)
-           (message "All tests executed without failure."))
+           (message "All tests passed."))
        (test-failed
         (message "%s" (error-message-string desc))
         (switch-to-buffer (nth 2 desc))

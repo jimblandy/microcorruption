@@ -33,7 +33,8 @@
 ;;;
 ;;; statements (S): can have side effects
 ;;;
-;;;   (set CC R E)             set register R to E; set flags according to CC
+;;;   (set R E)                set register R to E; set flags according to CC
+;;;   (test CC E)              set flags for E according to CC
 ;;;   (store Z E1 E2)          store E2 as a value of size Z at address E1
 ;;;   (jump E)                 jump to address E unconditionally
 ;;;   (branch C E)             jump to address E if (C R2 0)
@@ -128,7 +129,8 @@ Return a form (MARKER ADDR (S ...))."
     (bis (source dest) arithmetic | nil)
     (sub (source dest) arithmetic - -)
     (mov (source dest) move)
-    (ret () misc)))
+    (ret () misc)
+    (clr (dest) misc)))
 
 (defun parse-insn ()
   "Parse the MSP430 instruction at point.
@@ -162,21 +164,26 @@ Return a list of statements that have the same effect as the instruction."
            (let ((src (if byte-suffix (expr-force-byte (car opns)) (car opns)))
                  (dst (cadr opns))
                  (cc  (nth 4 def)))
-             (stmt-write cc dst (expr-any (cadddr def) dst src))))
+             (let* ((val (expr-any (cadddr def) dst src))
+                    (write (list (stmt-write dst val))))
+               (if cc (cons `(test ,cc ,val) write)
+                 write))))
           ((move)
            (let ((src (if byte-suffix (expr-force-byte (car opns)) (car opns)))
                  (dst (cadr opns)))
-             (stmt-write nil dst src)))
+             (list (stmt-write dst src))))
           ((misc)
            (case opcode
-             ((return)
-              '((set nil 0 (fetch word (reg 1)))
-                (set nil 1 (+ 2 (reg 1)))))))
+             ((ret)
+              '((set 0 (fetch word (reg 1)))
+                (set 1 (+ 2 (reg 1)))))
+             ((clr)
+              (list (stmt-write (car opns) 0)))))
           (otherwise (error "bogus instruction type in opcode-table")))))))
 
 (unit-tests
   (test-with-input (test-equal (parse-insn) '((store byte (+ 9216 (reg 15)) 0))))
-  ;; and.b	#0x0, 0x2400(r15)
+  ;; mov.b	#0x0, 0x2400(r15)
 
   (test-with-input (test-equal (parse-insn) '((store byte (+ 36 (reg 11)) (& 255 (reg 10))))))
   ;; mov.b   r10, 0x24(r11)
@@ -187,17 +194,28 @@ Return a list of statements that have the same effect as the instruction."
   (test-with-input (test-equal (parse-insn) '((store word (reg 11)  (fetch word (reg 10))))))
   ;; mov   0x0(r10), 0x0(r11)
 
-  (test-with-input (test-equal (parse-insn) '((set nil 1 17408))))
+  (test-with-input (test-equal (parse-insn) '((set 1 17408))))
   ;; mov	#0x4400, sp
 
-  (test-with-input (test-equal (parse-insn) '((set nil 5 255))))
+  (test-with-input (test-equal (parse-insn) '((set 5 255))))
   ;; mov.b	#-0x1, r5
 
-  (test-with-input (test-equal (parse-insn) '((set + 5 (& 255 (reg 5))))))
+  (test-with-input (test-equal (parse-insn) '((test + (& 255 (reg 5))) (set 5 (& 255 (reg 5))))))
   ;; and.b	#-0x1, r5
 
-  (test-with-input (test-equal (parse-insn) '((set + 5 (& 255 (reg 5))))))
+  (test-with-input (test-equal (parse-insn) '((test + (& 255 (reg 5))) (set 5 (& 255 (reg 5))))))
   ;; and.b   #0xff, r5
+
+  (test-with-input (test-equal (parse-insn) '((set 5 (| 23048 (reg 5))))))
+  ;; bis	#0x5a08, r5
+
+  (test-with-input (test-equal (parse-insn)
+                               '((set 0 (fetch word (reg 1)))
+                                 (set 1 (+ 2 (reg 1))))))
+  ;; ret
+
+  (test-with-input (test-equal (parse-insn) '((set 15 0))))
+  ;; clr r15
 )
 
 (defun bytep (n)
@@ -250,6 +268,34 @@ Return a list of statements that have the same effect as the instruction."
   (test-equal (expr-force-byte '(fetch byte 42)) '(fetch byte 42))
   (test-equal (expr-force-byte '(& (fetch byte 42) 1023)) '(& (fetch byte 42) 1023))
   (test-equal (expr-force-byte '(& (fetch word 42) 15)) '(& (fetch word 42) 15))
+  )
+
+(defun expr-| (a b)
+  (cond
+   ((and (numberp a) (numberp b))
+    (logior a b))
+   ((numberp b)
+    (expr-| b a))
+   ((and (numberp a) (zerop a))
+    b)
+   ((and (numberp a) (= (logand a #xffff) #xffff))
+    #xffff)
+   ((and (numberp a) (= (logand a #xff) #xff) (expr-bytep b))
+    #xff)
+   (t (pcase `(| ,a ,b)
+        ((and `(| ,x (| ,y ,z))
+              (guard (and (numberp x) (numberp y))))
+         (expr-| (logior x y) z))
+        (e e)))))
+
+(unit-tests
+  (test-equal (expr-| 10 5) 15)
+  (test-equal (expr-| 'x 5) '(| 5 x))
+  (test-equal (expr-| 'x 0) 'x)
+  (test-equal (expr-| 'x #xffff) 65535)
+  (test-equal (expr-| '(fetch byte x) #xff) 255)
+  (test-equal (expr-| '(| 8 x) 16) '(| 24 x))
+  (test-equal (expr-| 'x 'y) '(| x y))
   )
 
 (defun expr-+ (a b)
@@ -307,10 +353,11 @@ Return a list of statements that have the same effect as the instruction."
     ((+) (expr-+ a b))
     ((-) (expr-- a b))
     ((&) (expr-& a b))
+    ((|) (expr-| a b))
     (otherwise (list op a b))))
 
-(defun stmt-write (cc dst src)
+(defun stmt-write (dst src)
   (pcase dst
-    (`(reg ,r) `((set ,cc ,r ,src)))
-    (`(fetch ,z ,e) `((store ,z ,e ,src)))
+    (`(reg ,r) `(set ,r ,src))
+    (`(fetch ,z ,e) `(store ,z ,e ,src))
     (_ (error "bad dst"))))
