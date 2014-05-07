@@ -28,7 +28,11 @@ test."
                        (set-buffer stream)
                        (point-marker))))
       (if (not (markerp stream))
-          ;; Not a buffer; give up on providing source positions, but do run the tests.
+          ;; Not a buffer; give up on providing source positions, but do
+          ;; run the tests.
+          ;;
+          ;; Issue: This doesn't bind the dynamic variables, so the
+          ;; signalling and handling won't work right.
           `(progn ,@body)
 
         (let (forms)
@@ -38,7 +42,8 @@ test."
             ;; Place point after the first sexp in the list, the `unit-tests' symbol.
             (goto-char (scan-sexps (marker-position stream) -1))
             (goto-char (scan-lists (point) 1 -1))
-            (goto-char (scan-sexps (point) 1))
+            (unless (eq (read (current-buffer)) 'unit-tests)
+              (error "Don't seem to be able to find the (unit-tests ...) form"))
 
             ;; Find the end of the next sexp, while there is such to be found.
             (while (condition-case nil
@@ -72,11 +77,12 @@ test."
   (test-leave-point-at-failure
     (eval-buffer)))
 
-(defun test-eval-region ()
-  "Evaluate the current region, and run tests appearing in `unit-tests' bodies."
-  (interactive)
-  (test-leave-point-at-failure
-    (call-interactively 'eval-region)))
+;; eval-region doesn't seem to work the way we're expecting...
+;; (defun test-eval-region (start end)
+;;  "Evaluate the current region, and run tests appearing in `unit-tests' bodies."
+;;  (interactive "r")
+;;  (test-leave-point-at-failure
+;;    (eval-region start end)))
 
 (put 'test-failed 'error-conditions '(error test-failed))
 (put 'test-failed 'error-message "Unit test failed")
@@ -95,3 +101,10 @@ test."
      (_ (test-fail (format "Result %S does not match pattern %S"
                            actual ',pattern)))))
 
+(defmacro test-with-input (expr)
+  "Evaluate expr with point at the start of the comment text immediately following the `test-parse' form."
+  `(save-excursion
+     (goto-char (scan-sexps test-point 1))
+     (skip-chars-forward " \t\n;")
+     (let ((standard-input (current-buffer)))
+       ,expr)))

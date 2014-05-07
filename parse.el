@@ -124,6 +124,7 @@ Return a form (MARKER ADDR (S ...))."
 
 (defconst opcode-table
   '((and (source dest) arithmetic & +)
+    (add (source dest) arithmetic + +)
     (bis (source dest) arithmetic | nil)
     (sub (source dest) arithmetic - -)
     (mov (source dest) move)
@@ -173,29 +174,31 @@ Return a list of statements that have the same effect as the instruction."
                 (set nil 1 (+ 2 (reg 1)))))))
           (otherwise (error "bogus instruction type in opcode-table")))))))
 
-;; (parse-insn) mov.b	#0x0, 0x2400(r15)
-;; ((store byte (+ 9216 (reg 15)) 0))
-;;
-;; (parse-insn) mov.b   r10, 0x24(r11)
-;; ((store byte (+ 36 (reg 11)) (& 255 (reg 10))))
-;;
-;; (parse-insn) mov.b   0x0(r10), 0x0(r11)
-;; ((store byte (reg 11) (fetch byte (reg 10))))
-;;
-;; (parse-insn) mov   0x0(r10), 0x0(r11)
-;; ((store word (reg 11)  (fetch word (reg 10))))
-;;
-;; (parse-insn) mov	#0x4400, sp
-;; ((set nil 1 17408))
-;;
-;; (parse-insn) mov.b	#-0x1, r5
-;; ((set nil 5 255))
-;;
-;; (parse-insn) and.b	#-0x1, r5
-;; ((set + 5 (& 255 (reg 5))))
-;;
-;; (parse-insn) and.b   #0xff, r5
-;; ((set + 5 (& 255 (reg 5))))
+(unit-tests
+  (test-with-input (test-equal (parse-insn) '((store byte (+ 9216 (reg 15)) 0))))
+  ;; and.b	#0x0, 0x2400(r15)
+
+  (test-with-input (test-equal (parse-insn) '((store byte (+ 36 (reg 11)) (& 255 (reg 10))))))
+  ;; mov.b   r10, 0x24(r11)
+
+  (test-with-input (test-equal (parse-insn) '((store byte (reg 11) (fetch byte (reg 10))))))
+  ;; mov.b   0x0(r10), 0x0(r11)
+
+  (test-with-input (test-equal (parse-insn) '((store word (reg 11)  (fetch word (reg 10))))))
+  ;; mov   0x0(r10), 0x0(r11)
+
+  (test-with-input (test-equal (parse-insn) '((set nil 1 17408))))
+  ;; mov	#0x4400, sp
+
+  (test-with-input (test-equal (parse-insn) '((set nil 5 255))))
+  ;; mov.b	#-0x1, r5
+
+  (test-with-input (test-equal (parse-insn) '((set + 5 (& 255 (reg 5))))))
+  ;; and.b	#-0x1, r5
+
+  (test-with-input (test-equal (parse-insn) '((set + 5 (& 255 (reg 5))))))
+  ;; and.b   #0xff, r5
+)
 
 (defun bytep (n)
   (and (numberp n) (<= 0 n) (<= n 255)))
